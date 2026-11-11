@@ -1,4 +1,4 @@
-# 基线工作流 v2：补齐 manifest 锁定的模块源码和设备树；不改变内核配置。
+# 基线工作流 v3：验证完整压缩包后解压；失败时重试并回退到固定提交的 Git 下载。
 name: Erhai LineageOS exact-source baseline
 run-name: Erhai baseline - original config - no container patches
 'on':
@@ -97,15 +97,87 @@ jobs:
             sys.exit(1)
         print(f'Checked {len(checked)} external source links: all resolve.')
         CHECK
-    - name: Download pinned Clang and kernel build tools
+    - name: Download pinned tools with archive checks and Git fallback
       run: |
-        mkdir -p toolchain/clang toolchain/build-tools
-        curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 --max-time 1800   "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/${CLANG_COMMIT}/clang-r596125.tar.gz" -o toolchain/clang.tar.gz
-        tar -xzf toolchain/clang.tar.gz -C toolchain/clang
-        rm toolchain/clang.tar.gz
-        curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 --max-time 900   "https://android.googlesource.com/kernel/prebuilts/build-tools/+archive/${BUILD_TOOLS_COMMIT}/linux-x86.tar.gz" -o toolchain/build-tools.tar.gz
-        tar -xzf toolchain/build-tools.tar.gz -C toolchain/build-tools
-        rm toolchain/build-tools.tar.gz
+        mkdir -p toolchain diagnostics
+
+        # A successful HTTP transfer is not proof of a complete gzip stream.
+        # Each attempt starts from byte zero; never reuse a damaged archive.
+        fetch_archive() {
+          local url="$1" archive="$2" destination="$3"
+          local attempt
+          for attempt in 1 2; do
+            echo "Archive attempt ${attempt}/2: ${url}"
+            rm -f "$archive"
+            if curl --fail --location --connect-timeout 30 --max-time 900 \
+              --speed-time 120 --speed-limit 1024 "$url" -o "$archive" \
+              && gzip -t "$archive" \
+              && tar -tzf "$archive" > /dev/null; then
+              mkdir -p "${destination}.staging"
+              if tar -xzf "$archive" -C "${destination}.staging"; then
+                mv "${destination}.staging" "$destination"
+                rm -f "$archive"
+                return 0
+              fi
+            fi
+            echo "Download or archive validation failed; discarding incomplete data."
+            rm -f "$archive"
+            rm -rf "${destination}.staging"
+          done
+          return 1
+        }
+
+        # Git validates fetched objects and can avoid the large Gitiles archive endpoint.
+        # Sparse checkout retrieves the required subtree at the SAME pinned commit.
+        fetch_git_subtree() {
+          local url="$1" revision="$2" subtree="$3" destination="$4"
+          local attempt worktree="${destination}.git-download"
+          for attempt in 1 2; do
+            rm -rf "$worktree"
+            mkdir -p "$worktree"
+            if (
+              set -Eeuo pipefail
+              git init "$worktree"
+              git -C "$worktree" remote add origin "$url"
+              git -C "$worktree" sparse-checkout init --cone
+              git -C "$worktree" sparse-checkout set "$subtree"
+              git -C "$worktree" -c http.version=HTTP/1.1 -c protocol.version=2 \
+                fetch --no-tags --depth=1 --filter=blob:none origin "$revision"
+              git -C "$worktree" -c http.version=HTTP/1.1 checkout --detach FETCH_HEAD
+              test "$(git -C "$worktree" rev-parse HEAD)" = "$revision"
+              test -d "$worktree/$subtree"
+            ); then
+              mv "$worktree/$subtree" "$destination"
+              rm -rf "$worktree"
+              return 0
+            fi
+            echo "Git download attempt ${attempt}/2 failed."
+            rm -rf "$worktree"
+          done
+          return 1
+        }
+
+        if ! fetch_archive \
+          "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/${CLANG_COMMIT}/clang-r596125.tar.gz" \
+          toolchain/clang.tar.gz toolchain/clang; then
+          echo "Using pinned Git checkout for Clang."
+          fetch_git_subtree \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+            "$CLANG_COMMIT" clang-r596125 toolchain/clang
+        fi
+
+        if ! fetch_archive \
+          "https://android.googlesource.com/kernel/prebuilts/build-tools/+archive/${BUILD_TOOLS_COMMIT}/linux-x86.tar.gz" \
+          toolchain/build-tools.tar.gz toolchain/build-tools; then
+          echo "Using pinned Git checkout for kernel build tools."
+          fetch_git_subtree \
+            https://android.googlesource.com/kernel/prebuilts/build-tools \
+            "$BUILD_TOOLS_COMMIT" linux-x86 toolchain/build-tools
+        fi
+
+        test -x toolchain/clang/bin/clang
+        test -x toolchain/clang/bin/ld.lld
+        test -x toolchain/build-tools/bin/pahole
         printf '%s\n' "$GITHUB_WORKSPACE/toolchain/clang/bin" >> "$GITHUB_PATH"
         printf '%s\n' "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/toolchain/build-tools/lib64:$GITHUB_WORKSPACE/toolchain/clang/lib" >> "$GITHUB_ENV"
     - name: Check tool versions and exact config
