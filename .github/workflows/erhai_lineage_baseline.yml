@@ -1,4 +1,4 @@
-# 仅编译原配置基线：不会刷写设备。配置来自已验证可开机的 OPD2413。
+# 基线工作流 v2：补齐 manifest 锁定的模块源码和设备树；不改变内核配置。
 name: Erhai LineageOS exact-source baseline
 run-name: Erhai baseline - original config - no container patches
 'on':
@@ -21,6 +21,9 @@ jobs:
       BUILD_TOOLS_COMMIT: 811c6e2938d53b3c318d7635b03931601a68c765
       CONFIG_SHA256: b45a6fc5b9cbddd703d0e606e6250395cdaac1f8b91aa1f9627d42848f41962c
       EXPECTED_RELEASE: 6.6.144-4k-g6350e8af3f4c
+      KERNEL_SOURCE: sources/kernel/oneplus/sm8750
+      MODULES_COMMIT: e05c031ce1512477f2d5db7bfa26a859adfcfbc7
+      DEVICETREES_COMMIT: 2f46fad8ad309266de2405666016f8e0679883d5
     steps:
     - name: Install host dependencies
       run: |
@@ -43,15 +46,57 @@ jobs:
         pathlib.Path('diagnostics/captured.config').write_bytes(config)
         print('Captured config SHA256:', hashlib.sha256(config).hexdigest())
         CHECK
-    - name: Fetch exact LineageOS kernel commit
+    - name: Fetch exact kernel, modules and devicetrees; verify links
       run: |
-        git init kernel
-        git -C kernel remote add origin https://github.com/LineageOS/android_kernel_oneplus_sm8750.git
-        git -C kernel -c http.version=HTTP/1.1 fetch --no-tags --depth=1 origin "$KERNEL_COMMIT"
-        git -C kernel checkout --detach FETCH_HEAD
-        test "$(git -C kernel rev-parse HEAD)" = "$KERNEL_COMMIT"
-        git -C kernel show -s --format=fuller HEAD > diagnostics/source-commit.txt
-        test -z "$(git -C kernel status --porcelain)"
+        fetch_exact() {
+          local directory="$1" repository="$2" revision="$3"
+          mkdir -p "$directory"
+          git init "$directory"
+          git -C "$directory" remote add origin "https://github.com/LineageOS/${repository}.git"
+          git -C "$directory" -c http.version=HTTP/1.1 fetch --no-tags --depth=1 origin "$revision"
+          git -C "$directory" checkout --detach FETCH_HEAD
+          test "$(git -C "$directory" rev-parse HEAD)" = "$revision"
+          test -z "$(git -C "$directory" status --porcelain)"
+          git -C "$directory" show -s --format=fuller HEAD > "diagnostics/${repository}-commit.txt"
+        }
+        # Preserve the original sibling layout: the kernel contains relative symlinks into both trees.
+        fetch_exact "$KERNEL_SOURCE" android_kernel_oneplus_sm8750 "$KERNEL_COMMIT"
+        fetch_exact "${KERNEL_SOURCE}-modules" android_kernel_oneplus_sm8750-modules "$MODULES_COMMIT"
+        fetch_exact "${KERNEL_SOURCE}-devicetrees" android_kernel_oneplus_sm8750-devicetrees "$DEVICETREES_COMMIT"
+        python3 - <<'CHECK'
+        import os, pathlib, subprocess, sys
+        root = pathlib.Path(os.environ['KERNEL_SOURCE'])
+        entries = subprocess.check_output(['git', '-C', str(root), 'ls-files', '-s', '-z']).split(b'\0')
+        broken = []
+        checked = []
+        for entry in entries:
+            if not entry:
+                continue
+            metadata, name = entry.split(b'\t', 1)
+            if metadata.split()[0] != b'120000':
+                continue
+            relative = os.fsdecode(name)
+            path = root / relative
+            target = os.readlink(path)
+            if 'sm8750-modules' in target or 'sm8750-devicetrees' in target:
+                checked.append(f'{relative} -> {target}')
+                if not path.exists():
+                    broken.append(f'{relative} -> {target}')
+        required = [
+            'drivers/base/kernelFwUpdate/Kconfig',
+            'drivers/base/touchpanel_notify/Kconfig',
+            'drivers/base/magtransfer/Kconfig',
+            'arch/arm64/boot/dts/vendor',
+        ]
+        for relative in required:
+            if not (root / relative).exists():
+                broken.append('Required path missing: ' + relative)
+        pathlib.Path('diagnostics/external-source-links.txt').write_text('\n'.join(checked) + '\n')
+        if broken:
+            print('Broken source dependencies:\n' + '\n'.join(broken))
+            sys.exit(1)
+        print(f'Checked {len(checked)} external source links: all resolve.')
+        CHECK
     - name: Download pinned Clang and kernel build tools
       run: |
         mkdir -p toolchain/clang toolchain/build-tools
@@ -78,7 +123,7 @@ jobs:
         CHECK
         mkdir -p out
         cp diagnostics/captured.config out/.config
-        make -C kernel O="$GITHUB_WORKSPACE/out" ARCH=arm64 LLVM=1 LLVM_IAS=1   PAHOLE="$GITHUB_WORKSPACE/toolchain/build-tools/bin/pahole"   CONFIG_OPLUS_DEVICE_DTBS=y olddefconfig 2>&1 | tee diagnostics/olddefconfig.log
+        make -C "$KERNEL_SOURCE" O="$GITHUB_WORKSPACE/out" ARCH=arm64 LLVM=1 LLVM_IAS=1   PAHOLE="$GITHUB_WORKSPACE/toolchain/build-tools/bin/pahole"   CONFIG_OPLUS_DEVICE_DTBS=y olddefconfig 2>&1 | tee diagnostics/olddefconfig.log
         cp out/.config diagnostics/resolved.config
         python3 - <<'CHECK'
         import pathlib, re, sys
@@ -104,7 +149,7 @@ jobs:
             sys.exit(1)
         print('Config matches the captured running kernel.')
         CHECK
-        make -s -C kernel O="$GITHUB_WORKSPACE/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 kernelrelease > diagnostics/kernelrelease.txt
+        make -s -C "$KERNEL_SOURCE" O="$GITHUB_WORKSPACE/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 kernelrelease > diagnostics/kernelrelease.txt
         cat diagnostics/kernelrelease.txt
         test "$(cat diagnostics/kernelrelease.txt)" = "$EXPECTED_RELEASE"
     - name: Build unchanged baseline Image
@@ -115,9 +160,9 @@ jobs:
         export KBUILD_BUILD_TIMESTAMP='Thu Nov 5 01:33:32 UTC 2026'
         jobs=$(nproc)
         if [ "$jobs" -gt 4 ]; then jobs=4; fi
-        make -C kernel O="$GITHUB_WORKSPACE/out" ARCH=arm64 LLVM=1 LLVM_IAS=1   CONFIG_OPLUS_DEVICE_DTBS=y   PAHOLE="$GITHUB_WORKSPACE/toolchain/build-tools/bin/pahole"   -j"$jobs" Image 2>&1 | tee diagnostics/build.log
+        make -C "$KERNEL_SOURCE" O="$GITHUB_WORKSPACE/out" ARCH=arm64 LLVM=1 LLVM_IAS=1   CONFIG_OPLUS_DEVICE_DTBS=y   PAHOLE="$GITHUB_WORKSPACE/toolchain/build-tools/bin/pahole"   -j"$jobs" Image 2>&1 | tee diagnostics/build.log
         test -s out/arch/arm64/boot/Image
-        kernel/scripts/extract-ikconfig out/arch/arm64/boot/Image > diagnostics/image.config
+        "$KERNEL_SOURCE/scripts/extract-ikconfig" out/arch/arm64/boot/Image > diagnostics/image.config
         python3 - <<'CHECK'
         import pathlib
         # The kernel embeds the resolved .config verbatim; do not accept an unrelated output.
